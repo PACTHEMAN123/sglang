@@ -770,6 +770,7 @@ void es_fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 
+#ifdef SGL_KERNEL_ENABLE_SM100A
 void es_sm100_mxfp8_blockscaled_grouped_mm(
     const torch::Tensor& a,
     const torch::Tensor& b,
@@ -787,6 +788,7 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
     const torch::Tensor& blockscale_offsets,
     torch::Tensor& quant_output,
     torch::Tensor& scale_factor);
+#endif  // SGL_KERNEL_ENABLE_SM100A
 
 /*
  * From flashmla

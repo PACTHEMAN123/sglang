@@ -6,12 +6,26 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+from torch.cuda.memory import CUDAPluggableAllocator
+
+try:
+    from torch.cuda.memory import _cuda_releasePool
+except ImportError:
+    # torch < 2.7: no explicit releasePool, pool is freed via GC
+    def _cuda_releasePool(device, pool_id):
+        pass
+
+try:
+    from torch.cuda.memory import _cuda_beginAllocateCurrentThreadToPool
+except ImportError:
+    # torch < 2.7: renamed without "CurrentThread"
+    from torch.cuda.memory import _cuda_beginAllocateToPool as _cuda_beginAllocateCurrentThreadToPool
+
+try:
+    from torch.cuda.memory import _cuda_endAllocateToPool
+except ImportError:
+    # torch < 2.7: renamed from CurrentStream variant
+    from torch.cuda.memory import _cuda_endAllocateCurrentStreamToPool as _cuda_endAllocateToPool
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs

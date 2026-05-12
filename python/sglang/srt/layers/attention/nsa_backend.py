@@ -291,7 +291,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "torch"
 ]
 
 
@@ -641,7 +641,7 @@ class NativeSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
+        if is_cuda() and self.device_sm_major >= 9 and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
@@ -664,7 +664,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            except Exception:
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -930,7 +930,7 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
+        if is_cuda() and self.device_sm_major >= 9 and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
@@ -950,7 +950,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            except Exception:
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -1081,7 +1081,7 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        if is_cuda() and self.device_sm_major >= 9 and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
@@ -1107,7 +1107,7 @@ class NativeSparseAttnBackend(
                     )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            except Exception:
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
@@ -1299,7 +1299,7 @@ class NativeSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        if is_cuda() and self.device_sm_major >= 9:
             try:
                 import deep_gemm
 
@@ -1319,7 +1319,7 @@ class NativeSparseAttnBackend(
                     )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            except Exception:
                 pass
 
         self.forward_metadata = metadata
@@ -1520,6 +1520,17 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif nsa_impl == "torch":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_torch_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                logit_cap=layer.logit_cap,
+            )
         elif nsa_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1667,6 +1678,17 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif self.nsa_decode_impl == "torch":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_torch_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+                logit_cap=layer.logit_cap,
+            )
         elif self.nsa_decode_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1719,6 +1741,42 @@ class NativeSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_torch_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+        logit_cap: float,
+    ) -> torch.Tensor:
+        # Slow SM80-compatible fallback for GLM/DeepSeek NSA. It computes sparse
+        # MLA directly with PyTorch and avoids FlashMLA, FA3, TileLang, TRT-LLM,
+        # and DeepGEMM runtime dependencies.
+        kv_flat = kv_cache.reshape(-1, self.kv_cache_dim)
+        num_tokens, num_heads, head_dim = q_all.shape
+        out = q_all.new_empty((num_tokens, num_heads, v_head_dim))
+        chunk_size = 32
+
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            indices = page_table_1[start:end].to(torch.long)
+            valid = indices >= 0
+            safe_indices = indices.clamp(min=0)
+            selected = kv_flat.index_select(0, safe_indices.reshape(-1)).view(
+                end - start, indices.shape[1], self.kv_cache_dim
+            )
+            keys = selected[..., :head_dim]
+            values = selected[..., :v_head_dim]
+            scores = torch.einsum("bhd,btd->bht", q_all[start:end], keys) * sm_scale
+            if logit_cap is not None and logit_cap > 0:
+                scores = logit_cap * torch.tanh(scores / logit_cap)
+            scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+            probs = torch.softmax(scores.float(), dim=-1).to(q_all.dtype)
+            out[start:end] = torch.einsum("bht,btd->bhd", probs, values)
+
+        return out
 
     def _forward_flashmla_sparse(
         self,

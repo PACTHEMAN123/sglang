@@ -246,6 +246,7 @@ NSA_CHOICES = [
     "tilelang",
     "aiter",
     "trtllm",
+    "torch",
 ]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]

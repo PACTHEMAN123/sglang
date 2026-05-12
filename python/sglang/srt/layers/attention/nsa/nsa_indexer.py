@@ -22,6 +22,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
+    get_device_sm,
     get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
@@ -36,10 +37,12 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-if _is_cuda:
+_deep_gemm_available = False
+if _is_cuda and get_device_sm() >= 90:
     try:
         import deep_gemm
-    except ImportError as e:
+        _deep_gemm_available = True
+    except Exception as e:
         deep_gemm = e
 
 if _use_aiter:
@@ -199,7 +202,11 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = (
+                deep_gemm.get_num_sms()
+                if _deep_gemm_available
+                else torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            )
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -243,6 +250,7 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self._torch_index_k_cache: Optional[torch.Tensor] = None
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -1073,6 +1081,67 @@ class Indexer(MultiPlatformOp):
             index_k_scale=k_scale,
         )
 
+    def _use_torch_indexer_fallback(self, forward_batch: ForwardBatch) -> bool:
+        server_args = get_global_server_args()
+        return (
+            _is_cuda
+            and get_device_sm() < 89
+            and (
+                server_args.nsa_prefill_backend == "torch"
+                or server_args.nsa_decode_backend == "torch"
+            )
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
+        )
+
+    def _store_index_k_cache_torch(
+        self,
+        forward_batch: ForwardBatch,
+        key: torch.Tensor,
+    ) -> None:
+        pool = forward_batch.token_to_kv_pool
+        cache_size = pool.size + pool.page_size
+        if (
+            self._torch_index_k_cache is None
+            or self._torch_index_k_cache.shape[0] < cache_size
+            or self._torch_index_k_cache.device != key.device
+            or self._torch_index_k_cache.dtype != key.dtype
+        ):
+            self._torch_index_k_cache = torch.empty(
+                (cache_size, self.head_dim), dtype=key.dtype, device=key.device
+            )
+
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+        self._torch_index_k_cache[out_loc.long()] = key
+
+    def _get_topk_paged_torch(
+        self,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        assert self._torch_index_k_cache is not None
+        page_table = metadata.get_page_table_1().long()
+        seqlens = metadata.get_seqlens_int32().long()
+        safe_page_table = page_table.clamp(min=0)
+        keys = self._torch_index_k_cache.index_select(
+            0, safe_page_table.reshape(-1)
+        ).view(page_table.shape[0], page_table.shape[1], self.head_dim)
+
+        logits = torch.einsum("bhd,btd->bht", query, keys)
+        logits = (logits * weights[:, :, None]).sum(dim=1).float()
+        position_ids = torch.arange(
+            page_table.shape[1], device=page_table.device, dtype=seqlens.dtype
+        )
+        invalid = (page_table < 0) | (position_ids[None, :] >= seqlens[:, None])
+        logits = logits.masked_fill(invalid, float("-inf"))
+        return metadata.topk_transform(logits, self.index_topk)
+
     def forward_xpu(
         self,
         x: torch.Tensor,
@@ -1145,6 +1214,16 @@ class Indexer(MultiPlatformOp):
                     return_indices,
                 ),
             )
+
+        if self._use_torch_indexer_fallback(forward_batch):
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, False, forward_batch=forward_batch
+            )
+            self._store_index_k_cache_torch(forward_batch, key)
+            x_for_gate = x[0].to(torch.bfloat16) if isinstance(x, tuple) else x
+            weights = self._project_and_scale_head_gates(x_for_gate)
+            topk_result = self._get_topk_paged_torch(query, weights, metadata)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
