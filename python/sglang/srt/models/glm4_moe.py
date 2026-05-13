@@ -1219,8 +1219,14 @@ class Glm4MoeForCausalLM(nn.Module):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
         ):
             disable_reason = "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif self.quant_config and self.quant_config.get_name() in {
+            "auto-round",
+            "w4afp8",
+        }:
+            disable_reason = (
+                "GLM-4.5 AutoRound/W4AFP8 model uses different quant method "
+                "for routed experts and shared experts."
+            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
