@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.utils import unpack_cols
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
@@ -68,6 +69,32 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+
+def _dequant_compressed_tensors_wna16_linear(layer: nn.Module) -> torch.Tensor:
+    weight_packed = layer.weight_packed
+    weight_scale = layer.weight_scale
+    num_bits = 4
+    pack_factor = 32 // num_bits
+    out_features = weight_packed.shape[0]
+    in_features = weight_packed.shape[1] * pack_factor
+
+    weight = unpack_cols(
+        weight_packed,
+        num_bits=num_bits,
+        size_k=out_features,
+        size_n=in_features,
+    )
+    weight = (weight - (1 << (num_bits - 1))).to(torch.bfloat16)
+
+    group_count = weight_scale.shape[1]
+    assert (
+        in_features % group_count == 0
+    ), f"{in_features=} is not divisible by {group_count=}"
+    group_size = in_features // group_count
+    weight = weight.view(out_features, group_count, group_size)
+    weight = weight * weight_scale.to(torch.bfloat16).unsqueeze(-1)
+    return weight.view(out_features, in_features)
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -457,6 +484,10 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif hasattr(self_attn.kv_b_proj, "weight_packed") and hasattr(
+                self_attn.kv_b_proj, "weight_scale"
+            ):
+                w = _dequant_compressed_tensors_wna16_linear(self_attn.kv_b_proj)
             else:
                 w = self_attn.kv_b_proj.weight
 
