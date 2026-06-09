@@ -1472,12 +1472,18 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
+        fused_qkv_a_weight = (
+            getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
+            if self.has_fused_proj
+            else None
+        )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
             and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and fused_qkv_a_weight is not None
+            and fused_qkv_a_weight.dtype == torch.bfloat16
+            and fused_qkv_a_weight.shape[0] == 2112
+            and fused_qkv_a_weight.shape[1] == 7168
             and _is_cuda
             and 90 <= _device_sm < 120
         )
