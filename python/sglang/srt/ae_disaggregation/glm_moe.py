@@ -40,7 +40,7 @@ class GlmMoeLocalExperts(nn.Module):
         padded_config = copy.deepcopy(config)
         padded_config.n_routed_experts = self.padded_num_routed_experts
         # Shared experts are executed on A and must not be allocated on E.
-        padded_config.n_shared_experts = None
+        object.__setattr__(padded_config, "n_shared_experts", None)
 
         for layer_id in layer_ids:
             block = Glm4MoeSparseMoeBlock(
