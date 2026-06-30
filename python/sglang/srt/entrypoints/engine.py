@@ -575,29 +575,34 @@ class Engine(EngineScoreMixin, EngineBase):
 
         if server_args.enable_ae_disaggregation:
             # Deliberately mirrors Janus' role split: the A launch owns the
-            # ordinary SGLang scheduler, whereas the E launch starts seven
+            # ordinary SGLang scheduler, whereas the E launch starts
             # state-less MoE service loops and no tokenizer/KV-cache workers.
             scheduler_pipe_readers = []
             if server_args.attention_node != -1:
-                reader, writer = mp.Pipe(duplex=False)
-                proc = mp.Process(
-                    target=run_scheduler_process_func,
-                    args=(
-                        server_args,
-                        port_args,
-                        server_args.base_gpu_id,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        None,
-                        writer,
-                    ),
-                )
-                proc.start()
-                scheduler_procs.append(proc)
-                scheduler_pipe_readers.append(reader)
+                for tp_rank in range(server_args.tp_size):
+                    reader, writer = mp.Pipe(duplex=False)
+                    gpu_id = (
+                        server_args.base_gpu_id
+                        + tp_rank * server_args.gpu_id_step
+                    )
+                    proc = mp.Process(
+                        target=run_scheduler_process_func,
+                        args=(
+                            server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            0,
+                            0,
+                            0,
+                            0,
+                            None,
+                            writer,
+                        ),
+                    )
+                    proc.start()
+                    scheduler_procs.append(proc)
+                    scheduler_pipe_readers.append(reader)
             else:
                 from sglang.srt.ae_disaggregation.moe_runner import (
                     run_moe_runner_process,
