@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -477,6 +478,32 @@ def apply_gptq_marlin_linear(
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
+    if os.environ.get("SGLANG_AE_DEBUG_LAYOUT") == "1":
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+            should_log = (
+                server_args.enable_ae_disaggregation
+                and server_args.attention_node != -1
+            )
+        except Exception:
+            should_log = False
+        if should_log:
+            print(
+                "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear] "
+                f"input_shape={tuple(input.shape)} input_stride={tuple(input.stride())} "
+                f"input_is_contiguous={input.is_contiguous()} "
+                f"input_storage_offset={input.storage_offset()} "
+                f"reshaped_shape={tuple(reshaped_x.shape)} "
+                f"reshaped_stride={tuple(reshaped_x.stride())} "
+                f"reshaped_is_contiguous={reshaped_x.is_contiguous()} "
+                f"reshaped_storage_offset={reshaped_x.storage_offset()} "
+                f"weight_shape={tuple(weight.shape)} "
+                f"input_size_per_partition={input_size_per_partition} "
+                f"output_size_per_partition={output_size_per_partition}",
+                flush=True,
+            )
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
     use_atomic_add = should_use_atomic_add_reduce(
