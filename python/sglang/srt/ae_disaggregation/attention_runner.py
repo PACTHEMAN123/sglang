@@ -69,6 +69,18 @@ class AttentionRunner(ModelRunner):
             self.init_nvshmem_distributed()
             self._ae_nvshmem_initialized = True
 
+    def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        """Profile A-local KV memory without involving stateless E ranks."""
+        post_model_load_memory = get_available_gpu_memory(
+            self.device, self.gpu_id, distributed=False
+        )
+        rest_memory = post_model_load_memory - pre_model_load_memory * (
+            1 - self.mem_fraction_static
+        )
+        if self.mambaish_config is not None:
+            rest_memory = self.handle_max_mamba_cache(rest_memory)
+        return int(rest_memory * (1 << 30))
+
     def init_nvshmem_distributed(self):
         """Exact allocation order shared with Janus MoeRunner."""
         ep_group_info = get_ep_group_info(
