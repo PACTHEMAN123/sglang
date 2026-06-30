@@ -2045,11 +2045,11 @@ def initialize_ae_model_parallel(
     """Initialize the Janus-style asymmetric A/E groups.
 
     The default initializer assumes every rank owns the same model and hence
-    requires ``world_size == TP * PP``.  AE disaggregation has one stateful
-    attention rank and seven stateless expert ranks in the same torch/NVSHMEM
-    world.  Model-local groups are singletons; only the E ranks share the
-    routed-expert group.  Every process calls this function so ``new_group``
-    creation remains collective and deterministic.
+    requires ``world_size == TP * PP``.  AE disaggregation has stateful
+    attention TP ranks and stateless expert ranks in the same torch/NVSHMEM
+    world.  Attention ranks form the A-side TP group; E ranks use singleton TP
+    groups and share the routed-expert group.  Every process calls this
+    function so ``new_group`` creation remains collective and deterministic.
     """
     assert torch.distributed.is_initialized()
     world_size = torch.distributed.get_world_size()
@@ -2059,14 +2059,18 @@ def initialize_ae_model_parallel(
             f"AE world_size ({world_size}) must equal attention ranks "
             f"({attention_rank_count}) + expert ranks ({expert_rank_count})."
         )
-    if attention_rank_count != 1:
-        raise ValueError("The first AE implementation supports exactly one A rank.")
+    if attention_rank_count <= 0:
+        raise ValueError("AE disaggregation requires at least one attention rank.")
     if expert_rank_count <= 0:
         raise ValueError("AE disaggregation requires at least one expert rank.")
 
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     local_rank = get_world_group().local_rank
+    attention_ranks = list(range(attention_rank_count))
+    expert_ranks = list(range(attention_rank_count, world_size))
     singleton_groups = [[rank] for rank in range(world_size)]
+    attention_tp_groups = [attention_ranks] + [[rank] for rank in expert_ranks]
+    moe_ep_groups = [[rank] for rank in attention_ranks] + [expert_ranks]
 
     global _TP, _ATTN_CP, _ATTN_TP, _MOE_DP, _MOE_EP, _MOE_TP, _PP
     if any(
@@ -2076,22 +2080,22 @@ def initialize_ae_model_parallel(
         raise RuntimeError("Model parallel groups are already initialized.")
 
     # These groups are intentionally constructed in the same order on A and
-    # every E rank.  A never executes routed experts, so it belongs to a
-    # singleton placeholder EP group; E0..E6 form the real FusedMoE EP group.
+    # every E rank.  A never executes routed experts, so each A rank belongs to
+    # a singleton placeholder EP group; E ranks form the real FusedMoE EP group.
     _TP = init_model_parallel_group(
-        singleton_groups, local_rank, backend, group_name="ae_tp"
+        attention_tp_groups, local_rank, backend, group_name="ae_tp"
     )
     _ATTN_CP = init_model_parallel_group(
         singleton_groups, local_rank, backend, group_name="ae_attention_cp"
     )
     _ATTN_TP = init_model_parallel_group(
-        singleton_groups, local_rank, backend, group_name="ae_attention_tp"
+        attention_tp_groups, local_rank, backend, group_name="ae_attention_tp"
     )
     _MOE_DP = init_model_parallel_group(
         singleton_groups, local_rank, backend, group_name="ae_moe_dp"
     )
     _MOE_EP = init_model_parallel_group(
-        [[0], list(range(attention_rank_count, world_size))],
+        moe_ep_groups,
         local_rank,
         backend,
         use_pynccl=False,
