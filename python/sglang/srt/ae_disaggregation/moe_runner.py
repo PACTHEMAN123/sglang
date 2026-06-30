@@ -62,7 +62,9 @@ class MoeRunner:
             self.model_config.hf_config.hidden_size
         )
         if pipe_writer is not None:
-            pipe_writer.send({"ae_role": "expert", "ep_rank": ep_rank})
+            pipe_writer.send(
+                {"status": "ready", "ae_role": "expert", "ep_rank": ep_rank}
+            )
         self.forward_loop()
 
     def init_torch_distributed(self):
