@@ -16,24 +16,27 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeGate, Glm4MoeSparseMoeBlock
+from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 
 
 class GlmMoeLocalExperts(nn.Module):
     """A collection of GLM routed-expert layers for one E rank.
 
-    256 routed experts do not divide by seven.  ``FusedMoE`` consequently
-    sees 259 virtual slots (37 per E rank), while the replicated gate and
-    TopK retain the original 256-dimensional logits.  IDs 256--258 can never
-    be selected and therefore require no checkpoint weights.
+    The routed expert count does not necessarily divide the chosen number of
+    E ranks.  ``FusedMoE`` consequently sees a padded virtual expert count,
+    while the replicated gate and TopK retain the original 256-dimensional
+    logits.  Padding IDs can never be selected and therefore require no
+    checkpoint weights.
     """
 
     def __init__(self, config, layer_ids: Sequence[int], quant_config):
         super().__init__()
         self.config = config
         self.num_routed_experts = config.n_routed_experts
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.padded_num_routed_experts = (
-            (self.num_routed_experts + 6) // 7
-        ) * 7
+            (self.num_routed_experts + self.moe_ep_size - 1) // self.moe_ep_size
+        ) * self.moe_ep_size
         self.layer_ids = set(layer_ids)
         self.layers = nn.ModuleDict()
 
