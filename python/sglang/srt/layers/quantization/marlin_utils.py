@@ -546,45 +546,22 @@ def apply_gptq_marlin_linear(
     )
 
     forward_context = get_forward_context()
-    marlin_input = reshaped_x
-    marlin_size_m = reshaped_x.shape[0]
-    ae_debug_padded_single_row = False
-    if debug_ae_layout and forward_context is None and reshaped_x.shape[0] == 1:
-        marlin_input = torch.empty_strided(
-            (8, reshaped_x.shape[1]),
-            (reshaped_x.shape[1], 1),
-            dtype=reshaped_x.dtype,
-            device=reshaped_x.device,
-        )
-        marlin_input.zero_()
-        marlin_input[:1].copy_(reshaped_x)
-        marlin_size_m = marlin_input.shape[0]
-        ae_debug_padded_single_row = True
-        print(
-            "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear][debug_pad_m1] "
-            f"{_tensor_debug_summary('marlin_input', marlin_input)} "
-            f"original_size_m={reshaped_x.shape[0]} "
-            f"padded_size_m={marlin_size_m}",
-            flush=True,
-        )
     if debug_ae_layout:
         print(
             "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear][call] "
             f"path={'direct_gptq_marlin_gemm' if forward_context is None else 'unified_custom_op'} "
             f"forward_context_type={type(forward_context).__name__ if forward_context is not None else None} "
-            f"size_m={marlin_size_m} "
-            f"original_size_m={reshaped_x.shape[0]} "
+            f"size_m={reshaped_x.shape[0]} "
             f"size_n={output_size_per_partition} "
             f"size_k={input_size_per_partition} "
-            f"actual_k={marlin_input.shape[1]} "
-            f"use_atomic_add={use_atomic_add} "
-            f"ae_debug_padded_single_row={ae_debug_padded_single_row}",
+            f"actual_k={reshaped_x.shape[1]} "
+            f"use_atomic_add={use_atomic_add}",
             flush=True,
         )
     try:
         if forward_context is None:
             output = gptq_marlin_gemm(
-                marlin_input,
+                reshaped_x,
                 None,
                 weight,
                 weight_scale,
@@ -594,7 +571,7 @@ def apply_gptq_marlin_linear(
                 g_idx_sort_indices,
                 workspace,
                 wtype,
-                size_m=marlin_size_m,
+                size_m=reshaped_x.shape[0],
                 size_n=output_size_per_partition,
                 size_k=input_size_per_partition,
                 is_k_full=is_k_full,
@@ -602,8 +579,6 @@ def apply_gptq_marlin_linear(
                 use_fp32_reduce=use_fp32_reduce,
                 is_zp_float=False,
             )
-            if ae_debug_padded_single_row:
-                output = output[: reshaped_x.shape[0]]
         else:
             output = unified_apply_gptq_marlin_gemm_with_wtype(
                 input=reshaped_x,
@@ -629,7 +604,6 @@ def apply_gptq_marlin_linear(
                 f"exception={e!r} "
                 f"{_tensor_debug_summary('input', input)} "
                 f"{_tensor_debug_summary('reshaped_x', reshaped_x)} "
-                f"{_tensor_debug_summary('marlin_input', marlin_input)} "
                 f"{_tensor_debug_summary('weight', weight)} "
                 f"{_tensor_debug_summary('weight_scale', weight_scale)} "
                 f"{_tensor_debug_summary('weight_zp', weight_zp)} "
@@ -637,13 +611,11 @@ def apply_gptq_marlin_linear(
                 f"{_tensor_debug_summary('g_idx_sort_indices', g_idx_sort_indices)} "
                 f"{_tensor_debug_summary('workspace', workspace)} "
                 f"forward_context_type={type(forward_context).__name__ if forward_context is not None else None} "
-                f"size_m={marlin_size_m} "
-                f"original_size_m={reshaped_x.shape[0]} "
+                f"size_m={reshaped_x.shape[0]} "
                 f"size_n={output_size_per_partition} "
                 f"size_k={input_size_per_partition} "
-                f"actual_k={marlin_input.shape[1]} "
-                f"use_atomic_add={use_atomic_add} "
-                f"ae_debug_padded_single_row={ae_debug_padded_single_row}",
+                f"actual_k={reshaped_x.shape[1]} "
+                f"use_atomic_add={use_atomic_add}",
                 flush=True,
             )
         raise
