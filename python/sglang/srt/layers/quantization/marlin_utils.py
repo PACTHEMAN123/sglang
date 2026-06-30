@@ -63,6 +63,44 @@ MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 USE_FP32_REDUCE_DEFAULT = True
 
 
+def _ae_debug_enabled_on_attention_rank() -> bool:
+    if os.environ.get("SGLANG_AE_DEBUG_LAYOUT") != "1":
+        return False
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        return (
+            server_args.enable_ae_disaggregation
+            and server_args.attention_node != -1
+        )
+    except Exception:
+        return False
+
+
+def _tensor_debug_summary(name: str, tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    try:
+        storage_data_ptr = tensor.untyped_storage().data_ptr()
+    except Exception:
+        storage_data_ptr = "unavailable"
+    try:
+        data_ptr = tensor.data_ptr()
+    except Exception:
+        data_ptr = "unavailable"
+    return (
+        f"{name}_shape={tuple(tensor.shape)} "
+        f"{name}_stride={tuple(tensor.stride())} "
+        f"{name}_dtype={tensor.dtype} "
+        f"{name}_device={tensor.device} "
+        f"{name}_is_contiguous={tensor.is_contiguous()} "
+        f"{name}_storage_offset={tensor.storage_offset()} "
+        f"{name}_data_ptr={data_ptr} "
+        f"{name}_storage_data_ptr={storage_data_ptr}"
+    )
+
+
 @dataclass
 class MarlinLinearLayerConfig:
     full_weight_shape: tuple[int, int]  # [in, out]
@@ -478,32 +516,25 @@ def apply_gptq_marlin_linear(
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
-    if os.environ.get("SGLANG_AE_DEBUG_LAYOUT") == "1":
-        try:
-            from sglang.srt.server_args import get_global_server_args
-
-            server_args = get_global_server_args()
-            should_log = (
-                server_args.enable_ae_disaggregation
-                and server_args.attention_node != -1
-            )
-        except Exception:
-            should_log = False
-        if should_log:
-            print(
-                "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear] "
-                f"input_shape={tuple(input.shape)} input_stride={tuple(input.stride())} "
-                f"input_is_contiguous={input.is_contiguous()} "
-                f"input_storage_offset={input.storage_offset()} "
-                f"reshaped_shape={tuple(reshaped_x.shape)} "
-                f"reshaped_stride={tuple(reshaped_x.stride())} "
-                f"reshaped_is_contiguous={reshaped_x.is_contiguous()} "
-                f"reshaped_storage_offset={reshaped_x.storage_offset()} "
-                f"weight_shape={tuple(weight.shape)} "
-                f"input_size_per_partition={input_size_per_partition} "
-                f"output_size_per_partition={output_size_per_partition}",
-                flush=True,
-            )
+    debug_ae_layout = _ae_debug_enabled_on_attention_rank()
+    if debug_ae_layout:
+        print(
+            "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear][entry] "
+            f"{_tensor_debug_summary('input', input)} "
+            f"{_tensor_debug_summary('reshaped_x', reshaped_x)} "
+            f"{_tensor_debug_summary('weight', weight)} "
+            f"{_tensor_debug_summary('weight_scale', weight_scale)} "
+            f"{_tensor_debug_summary('weight_zp', weight_zp)} "
+            f"{_tensor_debug_summary('g_idx', g_idx)} "
+            f"{_tensor_debug_summary('g_idx_sort_indices', g_idx_sort_indices)} "
+            f"{_tensor_debug_summary('workspace', workspace)} "
+            f"wtype={wtype} "
+            f"input_size_per_partition={input_size_per_partition} "
+            f"output_size_per_partition={output_size_per_partition} "
+            f"is_k_full={is_k_full} "
+            f"use_fp32_reduce={use_fp32_reduce}",
+            flush=True,
+        )
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
     use_atomic_add = should_use_atomic_add_reduce(
@@ -515,43 +546,79 @@ def apply_gptq_marlin_linear(
     )
 
     forward_context = get_forward_context()
-    if forward_context is None:
-        output = gptq_marlin_gemm(
-            reshaped_x,
-            None,
-            weight,
-            weight_scale,
-            None,
-            weight_zp,
-            g_idx,
-            g_idx_sort_indices,
-            workspace,
-            wtype,
-            size_m=reshaped_x.shape[0],
-            size_n=output_size_per_partition,
-            size_k=input_size_per_partition,
-            is_k_full=is_k_full,
-            use_atomic_add=use_atomic_add,
-            use_fp32_reduce=use_fp32_reduce,
-            is_zp_float=False,
+    if debug_ae_layout:
+        print(
+            "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear][call] "
+            f"path={'direct_gptq_marlin_gemm' if forward_context is None else 'unified_custom_op'} "
+            f"forward_context_type={type(forward_context).__name__ if forward_context is not None else None} "
+            f"size_m={reshaped_x.shape[0]} "
+            f"size_n={output_size_per_partition} "
+            f"size_k={input_size_per_partition} "
+            f"actual_k={reshaped_x.shape[1]} "
+            f"use_atomic_add={use_atomic_add}",
+            flush=True,
         )
-    else:
-        output = unified_apply_gptq_marlin_gemm_with_wtype(
-            input=reshaped_x,
-            weight=weight,
-            weight_scale=weight_scale,
-            weight_zp=weight_zp,
-            g_idx=g_idx,
-            g_idx_sort_indices=g_idx_sort_indices,
-            workspace=workspace,
-            wtype_id=wtype.id,
-            output_size_per_partition=output_size_per_partition,
-            input_size_per_partition=input_size_per_partition,
-            is_k_full=is_k_full,
-            use_atomic_add=use_atomic_add,
-            use_fp32_reduce=use_fp32_reduce,
-            is_zp_float=False,
-        )
+    try:
+        if forward_context is None:
+            output = gptq_marlin_gemm(
+                reshaped_x,
+                None,
+                weight,
+                weight_scale,
+                None,
+                weight_zp,
+                g_idx,
+                g_idx_sort_indices,
+                workspace,
+                wtype,
+                size_m=reshaped_x.shape[0],
+                size_n=output_size_per_partition,
+                size_k=input_size_per_partition,
+                is_k_full=is_k_full,
+                use_atomic_add=use_atomic_add,
+                use_fp32_reduce=use_fp32_reduce,
+                is_zp_float=False,
+            )
+        else:
+            output = unified_apply_gptq_marlin_gemm_with_wtype(
+                input=reshaped_x,
+                weight=weight,
+                weight_scale=weight_scale,
+                weight_zp=weight_zp,
+                g_idx=g_idx,
+                g_idx_sort_indices=g_idx_sort_indices,
+                workspace=workspace,
+                wtype_id=wtype.id,
+                output_size_per_partition=output_size_per_partition,
+                input_size_per_partition=input_size_per_partition,
+                is_k_full=is_k_full,
+                use_atomic_add=use_atomic_add,
+                use_fp32_reduce=use_fp32_reduce,
+                is_zp_float=False,
+            )
+    except Exception as e:
+        if debug_ae_layout:
+            print(
+                "[AE_LAYOUT][marlin_utils][apply_gptq_marlin_linear][exception] "
+                f"exception_type={type(e).__name__} "
+                f"exception={e!r} "
+                f"{_tensor_debug_summary('input', input)} "
+                f"{_tensor_debug_summary('reshaped_x', reshaped_x)} "
+                f"{_tensor_debug_summary('weight', weight)} "
+                f"{_tensor_debug_summary('weight_scale', weight_scale)} "
+                f"{_tensor_debug_summary('weight_zp', weight_zp)} "
+                f"{_tensor_debug_summary('g_idx', g_idx)} "
+                f"{_tensor_debug_summary('g_idx_sort_indices', g_idx_sort_indices)} "
+                f"{_tensor_debug_summary('workspace', workspace)} "
+                f"forward_context_type={type(forward_context).__name__ if forward_context is not None else None} "
+                f"size_m={reshaped_x.shape[0]} "
+                f"size_n={output_size_per_partition} "
+                f"size_k={input_size_per_partition} "
+                f"actual_k={reshaped_x.shape[1]} "
+                f"use_atomic_add={use_atomic_add}",
+                flush=True,
+            )
+        raise
 
     if bias is not None:
         output.add_(bias)  # In-place add
