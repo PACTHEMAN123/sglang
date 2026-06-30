@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -488,6 +489,18 @@ def apply_gptq_marlin_linear(
     )
 
     forward_context = get_forward_context()
+    if os.environ.get("SGLANG_AE_DEBUG_QB", "0") == "1":
+        print(
+            "[AE_DEBUG_QB_MARLIN] "
+            f"forward_context_is_none={forward_context is None} "
+            f"input_shape={tuple(input.shape)} input_stride={tuple(input.stride())} "
+            f"reshaped_shape={tuple(reshaped_x.shape)} reshaped_stride={tuple(reshaped_x.stride())} "
+            f"input_contiguous={input.is_contiguous()} reshaped_contiguous={reshaped_x.is_contiguous()} "
+            f"output_size_per_partition={output_size_per_partition} "
+            f"input_size_per_partition={input_size_per_partition} "
+            f"is_k_full={is_k_full} use_atomic_add={use_atomic_add}",
+            flush=True,
+        )
     if forward_context is None:
         output = gptq_marlin_gemm(
             reshaped_x,

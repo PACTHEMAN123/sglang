@@ -465,6 +465,19 @@ class ColumnParallelLinear(LinearBase):
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
+        if (
+            get_bool_env_var("SGLANG_AE_DEBUG_QB")
+            and "q_b_proj" in getattr(self, "prefix", "")
+        ):
+            print(
+                "[AE_DEBUG_QB_LINEAR] "
+                f"prefix={self.prefix} tp_rank={self.tp_rank} tp_size={self.tp_size} "
+                f"input_shape={tuple(input_.shape)} input_stride={tuple(input_.stride())} "
+                f"input_contiguous={input_.is_contiguous()} "
+                f"output_size_per_partition={self.output_size_per_partition}",
+                flush=True,
+            )
+
         # Matrix multiply.
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
