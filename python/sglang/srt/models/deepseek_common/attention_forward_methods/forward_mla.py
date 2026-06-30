@@ -34,6 +34,27 @@ from sglang.srt.utils import BumpAllocator
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
+def _maybe_align_ae_q_b_proj_input(q: torch.Tensor) -> torch.Tensor:
+    server_args = get_global_server_args()
+    if (
+        not server_args.enable_ae_disaggregation
+        or server_args.attention_node == -1
+        or q.dim() != 2
+        or q.stride(0) % 8 == 0
+    ):
+        return q
+
+    aligned_q = torch.empty_strided(
+        q.shape,
+        (q.shape[1], 1),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    aligned_q.copy_(q)
+    return aligned_q
+
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
@@ -196,6 +217,7 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
+                    q = _maybe_align_ae_q_b_proj_input(q)
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
@@ -216,6 +238,7 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
+                q = _maybe_align_ae_q_b_proj_input(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
