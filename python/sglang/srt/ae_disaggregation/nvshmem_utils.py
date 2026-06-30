@@ -65,7 +65,10 @@ def init_nvshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
         flush=True,
     )
 
-    from cuda.core.experimental import Device
+    try:
+        from cuda.core import Device
+    except ImportError:
+        from cuda.core.experimental import Device
 
     nvshmem.core.init(
         device=Device(torch.cuda.current_device()),
