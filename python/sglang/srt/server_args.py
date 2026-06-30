@@ -608,6 +608,13 @@ class ServerArgs:
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+
+    # Attention-expert disaggregation. This is distinct from prefill/decode
+    # disaggregation: one stateful attention server delegates routed-MoE work
+    # to stateless expert workers.
+    enable_ae_disaggregation: bool = False
+    attention_node: int = -1
+    expert_node: int = -1
     eplb_min_rebalancing_utilization_threshold: float = 1.0
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
@@ -5667,6 +5674,27 @@ class ServerArgs:
             help="The expert parallelism size.",
         )
         parser.add_argument(
+            "--enable-ae-disaggregation",
+            action="store_true",
+            default=ServerArgs.enable_ae_disaggregation,
+            help=(
+                "Enable experimental attention-expert disaggregation. "
+                "Use --attention-node or --expert-node to select exactly one role."
+            ),
+        )
+        parser.add_argument(
+            "--attention-node",
+            type=int,
+            default=ServerArgs.attention_node,
+            help="AE attention role index, or -1 when this process is an expert worker.",
+        )
+        parser.add_argument(
+            "--expert-node",
+            type=int,
+            default=ServerArgs.expert_node,
+            help="AE expert role index, or -1 when this process is an attention worker.",
+        )
+        parser.add_argument(
             "--moe-a2a-backend",
             type=str,
             choices=MOE_A2A_BACKEND_CHOICES,
@@ -6882,9 +6910,12 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        if self.enable_ae_disaggregation:
+            self._check_ae_disaggregation_args()
+        else:
+            assert (
+                self.tp_size * self.pp_size
+            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
@@ -7052,6 +7083,53 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+    def _check_ae_disaggregation_args(self):
+        """Validate the deliberately narrow first AE prototype.
+
+        AE uses two launch_server processes as logical nodes even when they
+        share one physical host.  Its process world is therefore not the
+        standard ``tp_size * pp_size`` serving world and must bypass that
+        generic divisibility check above.
+        """
+        if (self.attention_node == -1) == (self.expert_node == -1):
+            raise ValueError(
+                "AE disaggregation requires exactly one of --attention-node "
+                "or --expert-node to be non-negative."
+            )
+        if self.attention_node not in (-1, 0) or self.expert_node not in (-1, 0):
+            raise ValueError(
+                "The first AE prototype supports one attention role and one "
+                "expert role only; role indices must be 0 or -1."
+            )
+        if self.tp_size != 1 or self.ep_size != 7:
+            raise ValueError(
+                "The first AE prototype requires --tp-size 1 and --ep-size 7."
+            )
+        if self.pp_size != 1 or self.dp_size != 1:
+            raise ValueError(
+                "AE disaggregation does not support pipeline or data parallelism "
+                "in the first prototype. Set --pp-size 1 --dp-size 1."
+            )
+        if self.micro_batch_num != 1:
+            raise ValueError(
+                "The first AE prototype supports --micro-batch-num 1 only; "
+                "current GLM A-side routing has not yet been wired to MBO."
+            )
+        if self.moe_a2a_backend != "none":
+            raise ValueError(
+                "AE disaggregation owns routed-MoE transport. Set "
+                "--moe-a2a-backend none."
+            )
+        if not self.disable_cuda_graph:
+            raise ValueError(
+                "The first AE prototype requires --disable-cuda-graph."
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "AE disaggregation cannot be combined with prefill/decode "
+                "disaggregation."
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

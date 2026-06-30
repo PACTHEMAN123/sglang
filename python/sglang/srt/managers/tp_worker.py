@@ -342,9 +342,16 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _init_model_runner(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        if self.server_args.enable_ae_disaggregation:
+            from sglang.srt.ae_disaggregation.attention_runner import AttentionRunner
 
-        self._model_runner = ModelRunner(
+            runner_cls = AttentionRunner
+        else:
+            from sglang.srt.model_executor.model_runner import ModelRunner
+
+            runner_cls = ModelRunner
+
+        self._model_runner = runner_cls(
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,

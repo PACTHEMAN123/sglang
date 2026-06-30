@@ -14,6 +14,7 @@
 
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
+import asyncio
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -783,6 +784,70 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
 
+class Glm4AeSparseMoeBlock(nn.Module):
+    """Janus-style attention-side GLM MoE block.
+
+    Routed experts, gate and TopK live exclusively on the E workers. A keeps
+    shared experts and replaces its routed-MoE call with a full-hidden-state
+    NVSHMEM round trip. The handler retains Janus' async API; the current GLM
+    layer path is synchronous, so this is the required boundary adapter.
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        super().__init__()
+        del alt_stream
+        self.layer_id = layer_id
+        self.shared_experts = Glm4MoeMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            reduce_results=False,
+            tp_rank=0,
+            tp_size=1,
+            prefix=add_prefix("shared_experts", prefix),
+        )
+        self._communicator = None
+
+    def _get_communicator(self):
+        if self._communicator is None:
+            from sglang.srt.ae_disaggregation.nvshmem_comm import (
+                AttnNvshmemCommunicationHandler,
+            )
+
+            self._communicator = AttnNvshmemCommunicationHandler()
+        return self._communicator
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        del forward_batch, should_allreduce_fusion, use_reduce_scatter
+        communicator = self._get_communicator()
+        asyncio.run(
+            communicator.send_attention_result(
+                batch_id=0,
+                layer_index=self.layer_id,
+                gpu_hidden_state=hidden_states,
+            )
+        )
+        shared_output = self.shared_experts(hidden_states)
+        routed_output = asyncio.run(
+            communicator.recv_moe_result(layer_index=self.layer_id, batch_id=0)
+        )
+        return routed_output.add_(shared_output)
+
+
 class Glm4MoeDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -841,7 +906,13 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Glm4MoeSparseMoeBlock(
+            moe_block_cls = (
+                Glm4AeSparseMoeBlock
+                if get_global_server_args().enable_ae_disaggregation
+                and get_global_server_args().attention_node != -1
+                else Glm4MoeSparseMoeBlock
+            )
+            self.mlp = moe_block_cls(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),

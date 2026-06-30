@@ -573,7 +573,52 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
 
-        if server_args.dp_size == 1:
+        if server_args.enable_ae_disaggregation:
+            # Deliberately mirrors Janus' role split: the A launch owns the
+            # ordinary SGLang scheduler, whereas the E launch starts seven
+            # state-less MoE service loops and no tokenizer/KV-cache workers.
+            scheduler_pipe_readers = []
+            if server_args.attention_node != -1:
+                reader, writer = mp.Pipe(duplex=False)
+                proc = mp.Process(
+                    target=run_scheduler_process_func,
+                    args=(
+                        server_args,
+                        port_args,
+                        server_args.base_gpu_id,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        None,
+                        writer,
+                    ),
+                )
+                proc.start()
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+            else:
+                from sglang.srt.ae_disaggregation.moe_runner import (
+                    run_moe_runner_process,
+                )
+
+                for ep_rank in range(server_args.ep_size):
+                    reader, writer = mp.Pipe(duplex=False)
+                    proc = mp.Process(
+                        target=run_moe_runner_process,
+                        args=(
+                            server_args,
+                            port_args,
+                            server_args.base_gpu_id + ep_rank,
+                            ep_rank,
+                            writer,
+                        ),
+                    )
+                    proc.start()
+                    scheduler_procs.append(proc)
+                    scheduler_pipe_readers.append(reader)
+        elif server_args.dp_size == 1:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=server_args.enable_memory_saver
