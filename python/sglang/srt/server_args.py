@@ -7102,9 +7102,10 @@ class ServerArgs:
                 "The first AE prototype supports one attention role and one "
                 "expert role only; role indices must be 0 or -1."
             )
-        if self.tp_size != 1 or self.ep_size != 7:
+        if self.tp_size <= 0 or self.ep_size <= 0 or self.tp_size + self.ep_size != 8:
             raise ValueError(
-                "The first AE prototype requires --tp-size 1 and --ep-size 7."
+                "The first AE prototype currently targets one 8-GPU node and "
+                "requires positive --tp-size/--ep-size with tp_size + ep_size == 8."
             )
         if self.pp_size != 1 or self.dp_size != 1:
             raise ValueError(

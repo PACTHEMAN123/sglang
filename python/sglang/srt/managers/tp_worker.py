@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_tp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -314,15 +314,20 @@ class TpModelWorker(BaseTpWorker):
         #
         # In AE disaggregation, expert ranks join the torch distributed world
         # for NVSHMEM/NCCL bootstrap, but they do not run the attention-side
-        # TpModelWorker.  For the current 1:7 bring-up, attention TP size is 1,
-        # so a global world_group broadcast would wait forever for expert
-        # ranks that never enter this code path.
+        # TpModelWorker.  Therefore attention-side worker synchronization must
+        # stay inside the A-side TP group instead of using the global world
+        # group, which also contains E ranks.
         if (
             server_args.enable_ae_disaggregation
             and server_args.attention_node != -1
-            and self.tp_size == 1
         ):
-            self.random_seed = server_args.random_seed
+            tp_group = get_tp_group()
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],
