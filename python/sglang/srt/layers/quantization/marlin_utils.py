@@ -477,8 +477,6 @@ def apply_gptq_marlin_linear(
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
 ) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
-    if reshaped_x.stride(0) % 8 != 0:
-        reshaped_x = reshaped_x.contiguous()
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
     use_atomic_add = should_use_atomic_add_reduce(
