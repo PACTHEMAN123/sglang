@@ -310,13 +310,26 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
-        # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        # Sync random seed across TP workers.
+        #
+        # In AE disaggregation, expert ranks join the torch distributed world
+        # for NVSHMEM/NCCL bootstrap, but they do not run the attention-side
+        # TpModelWorker.  For the current 1:7 bring-up, attention TP size is 1,
+        # so a global world_group broadcast would wait forever for expert
+        # ranks that never enter this code path.
+        if (
+            server_args.enable_ae_disaggregation
+            and server_args.attention_node != -1
+            and self.tp_size == 1
+        ):
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
