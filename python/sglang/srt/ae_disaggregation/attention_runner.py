@@ -47,7 +47,11 @@ class AttentionRunner(ModelRunner):
         initialize_dp_attention(
             server_args=self.server_args, model_config=self.model_config
         )
-        return get_available_gpu_memory(self.device, self.gpu_id)
+        self.init_nvshmem_distributed()
+        self._ae_nvshmem_initialized = True
+        return get_available_gpu_memory(
+            self.device, self.gpu_id, distributed=False
+        )
 
     def initialize(self, pre_model_load_memory: float):
         # The current SGLang ModelRunner initializes EPLB/expert-location metadata
@@ -61,7 +65,9 @@ class AttentionRunner(ModelRunner):
             super().initialize(pre_model_load_memory)
         finally:
             self.server_args.ep_size = ae_ep_size
-        self.init_nvshmem_distributed()
+        if not getattr(self, "_ae_nvshmem_initialized", False):
+            self.init_nvshmem_distributed()
+            self._ae_nvshmem_initialized = True
 
     def init_nvshmem_distributed(self):
         """Exact allocation order shared with Janus MoeRunner."""
