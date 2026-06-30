@@ -1793,8 +1793,8 @@ class DeepseekAeSparseMoeBlock(nn.Module):
         asyncio.run(
             handler.send_attention_result(
                 batch_id=batch_id,
-                layer_id=self.layer_id,
-                hidden_states=hidden_states,
+                layer_index=self.layer_id,
+                gpu_hidden_state=hidden_states,
             )
         )
 
@@ -1802,7 +1802,7 @@ class DeepseekAeSparseMoeBlock(nn.Module):
             hidden_states, gemm_output_zero_allocator
         )
         routed_output = asyncio.run(
-            handler.recv_moe_result(layer_id=self.layer_id, batch_id=batch_id)
+            handler.recv_moe_result(layer_index=self.layer_id, batch_id=batch_id)
         )
 
         if shared_output is not None:
