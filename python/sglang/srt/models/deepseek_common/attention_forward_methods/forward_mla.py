@@ -37,14 +37,13 @@ if TYPE_CHECKING:
 
 def _maybe_align_ae_q_b_proj_input(q: torch.Tensor) -> torch.Tensor:
     server_args = get_global_server_args()
-    q_2d = q.reshape(-1, q.shape[-1])
     if (
         not server_args.enable_ae_disaggregation
         or server_args.attention_node == -1
-        or q_2d.stride(0) % 8 == 0
     ):
         return q
 
+    q_2d = q.reshape(-1, q.shape[-1])
     aligned_q = torch.empty_strided(
         q_2d.shape,
         (q_2d.shape[1], 1),
