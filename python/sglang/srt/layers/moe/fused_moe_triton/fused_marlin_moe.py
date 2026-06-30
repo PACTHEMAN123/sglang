@@ -7,6 +7,7 @@ from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
+_torch_float8_e8m0fnu = getattr(torch, "float8_e8m0fnu", None)
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -22,7 +23,8 @@ def get_scalar_type(num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] 
         not has_zp
         and num_bits == 4
         and scales is not None
-        and scales.dtype == torch.float8_e8m0fnu
+        and _torch_float8_e8m0fnu is not None
+        and scales.dtype == _torch_float8_e8m0fnu
     ):
         return scalar_types.float4_e2m1f
     if has_zp:
@@ -115,15 +117,16 @@ def fused_marlin_moe(
         num_bits == 4
         and w1_zeros is None
         and w2_zeros is None
-        and w1_scale.dtype == torch.float8_e8m0fnu
-        and w2_scale.dtype == torch.float8_e8m0fnu
+        and _torch_float8_e8m0fnu is not None
+        and w1_scale.dtype == _torch_float8_e8m0fnu
+        and w2_scale.dtype == _torch_float8_e8m0fnu
     )
     if is_mxfp4_marlin:
-        assert w1_scale.dtype == torch.float8_e8m0fnu, (
+        assert w1_scale.dtype == _torch_float8_e8m0fnu, (
             "MXFP4 Marlin expects w1_scale to be torch.float8_e8m0fnu, "
             f"got {w1_scale.dtype}"
         )
-        assert w2_scale.dtype == torch.float8_e8m0fnu, (
+        assert w2_scale.dtype == _torch_float8_e8m0fnu, (
             "MXFP4 Marlin expects w2_scale to be torch.float8_e8m0fnu, "
             f"got {w2_scale.dtype}"
         )
