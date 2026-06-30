@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -1720,6 +1721,95 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
+class DeepseekAeSparseMoeBlock(nn.Module):
+    """Attention-side MoE stub for GLM5.1 AE disaggregation."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        layer_id: int = 0,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.n_shared_experts = config.n_shared_experts
+
+        if self.n_shared_experts is not None and self.n_shared_experts > 0:
+            intermediate_size = config.moe_intermediate_size * self.n_shared_experts
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                swiglu_limit=getattr(config, "swiglu_limit", None),
+                prefix=add_prefix("shared_experts", prefix),
+                tp_rank=0,
+                tp_size=1,
+            )
+
+        self._handler = None
+
+    def _get_handler(self):
+        if self._handler is None:
+            from sglang.srt.ae_disaggregation.nvshmem_comm import (
+                AttnNvshmemCommunicationHandler,
+            )
+
+            self._handler = AttnNvshmemCommunicationHandler()
+        return self._handler
+
+    def _forward_shared_experts(
+        self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+    ):
+        if hidden_states.shape[0] == 0 or not hasattr(self, "shared_experts"):
+            return None
+        return self.shared_experts(
+            hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_ids_global: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del (
+            forward_batch,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+            input_ids,
+            input_ids_global,
+        )
+
+        handler = self._get_handler()
+        batch_id = 0
+        asyncio.run(
+            handler.send_attention_result(
+                batch_id=batch_id,
+                layer_id=self.layer_id,
+                hidden_states=hidden_states,
+            )
+        )
+
+        shared_output = self._forward_shared_experts(
+            hidden_states, gemm_output_zero_allocator
+        )
+        routed_output = asyncio.run(
+            handler.recv_moe_result(layer_id=self.layer_id, batch_id=batch_id)
+        )
+
+        if shared_output is not None:
+            routed_output.add_(shared_output)
+        return routed_output
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -1789,14 +1879,23 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = DeepseekV2MoE(
-                config=config,
-                quant_config=moe_quant_config_override or quant_config,
-                prefix=add_prefix("mlp", prefix),
-                layer_id=self.layer_id,
-                alt_stream=alt_stream,
-                is_nextn=is_nextn,
-            )
+            server_args = get_global_server_args()
+            if server_args.enable_ae_disaggregation and server_args.attention_node != -1:
+                self.mlp = DeepseekAeSparseMoeBlock(
+                    config=config,
+                    quant_config=moe_quant_config_override or quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                    layer_id=self.layer_id,
+                )
+            else:
+                self.mlp = DeepseekV2MoE(
+                    config=config,
+                    quant_config=moe_quant_config_override or quant_config,
+                    prefix=add_prefix("mlp", prefix),
+                    layer_id=self.layer_id,
+                    alt_stream=alt_stream,
+                    is_nextn=is_nextn,
+                )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1

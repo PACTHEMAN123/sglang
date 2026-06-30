@@ -43,7 +43,7 @@ class MoeRunner:
         # Torch ranks are [attention ranks][expert ranks], exactly as Janus.
         self.rank = server_args.tp_size + ep_rank
         self.local_rank = gpu_id
-        self.micro_batch_num = server_args.micro_batch_num
+        self.micro_batch_num = getattr(server_args, "micro_batch_num", 1)
         self.model = None
 
         torch.cuda.set_device(gpu_id)

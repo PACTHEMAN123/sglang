@@ -7111,7 +7111,8 @@ class ServerArgs:
                 "AE disaggregation does not support pipeline or data parallelism "
                 "in the first prototype. Set --pp-size 1 --dp-size 1."
             )
-        if self.micro_batch_num != 1:
+        micro_batch_num = getattr(self, "micro_batch_num", 1)
+        if micro_batch_num != 1:
             raise ValueError(
                 "The first AE prototype supports --micro-batch-num 1 only; "
                 "current GLM A-side routing has not yet been wired to MBO."

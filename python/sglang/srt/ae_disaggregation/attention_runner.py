@@ -29,9 +29,10 @@ class AttentionRunner(ModelRunner):
     def init_torch_distributed(self):
         torch.cuda.set_device(self.gpu_id)
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        self.ae_ep_size = self.server_args.ep_size
         init_distributed_environment(
             backend="nccl",
-            world_size=self.server_args.tp_size + self.server_args.ep_size,
+            world_size=self.server_args.tp_size + self.ae_ep_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
             distributed_init_method="tcp://" + self.server_args.dist_init_addr,
@@ -41,7 +42,7 @@ class AttentionRunner(ModelRunner):
         set_global_server_args_for_scheduler(self.server_args)
         initialize_ae_model_parallel(
             attention_rank_count=self.server_args.tp_size,
-            expert_rank_count=self.server_args.ep_size,
+            expert_rank_count=self.ae_ep_size,
         )
         initialize_dp_attention(
             server_args=self.server_args, model_config=self.model_config
@@ -49,14 +50,24 @@ class AttentionRunner(ModelRunner):
         return get_available_gpu_memory(self.device, self.gpu_id)
 
     def initialize(self, pre_model_load_memory: float):
-        super().initialize(pre_model_load_memory)
+        # The current SGLang ModelRunner initializes EPLB/expert-location metadata
+        # before GLM layers are swapped to the AE A-side MoE block.  GLM-5.1 has
+        # 256 routed experts, which is not divisible by the AE ep-size 7.  A does
+        # not own routed experts, so keep ep_size=7 only for distributed/NVSHMEM
+        # setup and make local model initialization see ep_size=1.
+        ae_ep_size = getattr(self, "ae_ep_size", self.server_args.ep_size)
+        self.server_args.ep_size = 1
+        try:
+            super().initialize(pre_model_load_memory)
+        finally:
+            self.server_args.ep_size = ae_ep_size
         self.init_nvshmem_distributed()
 
     def init_nvshmem_distributed(self):
         """Exact allocation order shared with Janus MoeRunner."""
         ep_group_info = get_ep_group_info(
             tp_size=self.server_args.tp_size,
-            ep_size=self.server_args.ep_size,
+            ep_size=self.ae_ep_size,
             moe_node_num=1,
             enable_ep_intra_node_reduce=False,
         )
@@ -66,7 +77,7 @@ class AttentionRunner(ModelRunner):
         hidden_dim = self.model_config.hf_config.hidden_size
         max_tokens = int(os.environ.get("NVSHMEM_MAX_TOKENS", 4096))
         buf_numel = max_tokens * hidden_dim
-        micro_batch_num = self.server_args.micro_batch_num
+        micro_batch_num = getattr(self.server_args, "micro_batch_num", 1)
         max_ep_peers = max(
             len(peers) for peers in ep_group_info["send_strategy"].values()
         )
@@ -100,7 +111,7 @@ class AttentionRunner(ModelRunner):
                 "nvshmem_e2a_src": e2a_src,
                 "nvshmem_e2a_sigs": e2a_sigs,
                 "tp_size": self.server_args.tp_size,
-                "ep_size": self.server_args.ep_size,
+                "ep_size": self.ae_ep_size,
                 "micro_batch_num": micro_batch_num,
             }
         )
