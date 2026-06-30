@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -34,46 +33,6 @@ from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-
-
-def _maybe_align_ae_q_b_proj_input(q: torch.Tensor) -> torch.Tensor:
-    server_args = get_global_server_args()
-    if (
-        not server_args.enable_ae_disaggregation
-        or server_args.attention_node == -1
-    ):
-        return q
-
-    q_2d = q.reshape(-1, q.shape[-1])
-    debug_layout = os.environ.get("SGLANG_AE_DEBUG_LAYOUT") == "1"
-    if debug_layout:
-        print(
-            "[AE_LAYOUT][forward_mla][before_q_b_proj] "
-            f"q_shape={tuple(q.shape)} q_stride={tuple(q.stride())} "
-            f"q_is_contiguous={q.is_contiguous()} q_storage_offset={q.storage_offset()} "
-            f"q_2d_shape={tuple(q_2d.shape)} q_2d_stride={tuple(q_2d.stride())} "
-            f"q_2d_is_contiguous={q_2d.is_contiguous()} "
-            f"q_2d_storage_offset={q_2d.storage_offset()}",
-            flush=True,
-        )
-    aligned_q = torch.empty_strided(
-        q_2d.shape,
-        (q_2d.shape[1], 1),
-        dtype=q.dtype,
-        device=q.device,
-    )
-    aligned_q.copy_(q_2d)
-    if debug_layout:
-        print(
-            "[AE_LAYOUT][forward_mla][after_q_b_proj_align] "
-            f"aligned_shape={tuple(aligned_q.shape)} "
-            f"aligned_stride={tuple(aligned_q.stride())} "
-            f"aligned_is_contiguous={aligned_q.is_contiguous()} "
-            f"aligned_storage_offset={aligned_q.storage_offset()}",
-            flush=True,
-        )
-    return aligned_q
-
 
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
@@ -237,7 +196,6 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = _maybe_align_ae_q_b_proj_input(q)
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
@@ -258,7 +216,6 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = _maybe_align_ae_q_b_proj_input(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
