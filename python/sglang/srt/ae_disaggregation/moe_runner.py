@@ -75,6 +75,9 @@ class MoeRunner:
             local_rank=self.local_rank,
             distributed_init_method="tcp://" + self.server_args.dist_init_addr,
         )
+        # E only owns routed experts.  Keep the GLM MoE block from folding
+        # shared experts into the routed FusedMoE allocation.
+        self.server_args.disable_shared_experts_fusion = True
         set_global_server_args_for_scheduler(self.server_args)
         initialize_ae_model_parallel(
             attention_rank_count=self.server_args.tp_size,
