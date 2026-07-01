@@ -101,17 +101,10 @@ class AttnNvshmemCommunicationHandler:
             torch_rank_to_pe_rank(rank)
             for rank in self.map_att_to_moe[self.rank]
         ]
-        print(f"[AttnNvshmem] rank={self.rank} send_targets(PE)={self.send_targets}")
-
         self.ep_group_info = global_server_args_dict["ep_group_info"]
         self.expected_ep_ranks = self.ep_group_info["send_strategy"].get(
             self.rank, []
         )
-        print(
-            f"[AttnNvshmem] rank={self.rank} "
-            f"expected_ep_ranks={self.expected_ep_ranks}"
-        )
-
         self.a2e_bufs = global_server_args_dict["nvshmem_a2e_bufs"]
         self.a2e_sigs = global_server_args_dict["nvshmem_a2e_sigs"]
         self.e2a_dst_slots = global_server_args_dict["nvshmem_e2a_dst_slots"]

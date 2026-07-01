@@ -793,6 +793,33 @@ class Engine(EngineScoreMixin, EngineBase):
         ):
             run_expert_backup_manager(server_args, port_args)
 
+        if server_args.enable_ae_disaggregation and server_args.attention_node == -1:
+            # Expert-only AE launch owns stateless MoE runner processes, not the
+            # normal tokenizer/detokenizer/HTTP serving stack.  Once all E
+            # runners report ready, keep this parent alive as their supervisor.
+            scheduler_init_result.wait_for_ready()
+
+            if os.getenv("SGLANG_BLOCK_AE_EXPERT_PARENT") == "0":
+                return (
+                    None,
+                    None,
+                    port_args,
+                    scheduler_init_result,
+                    None,
+                )
+
+            launch_dummy_health_check_server(
+                server_args.host, server_args.port, server_args.enable_metrics
+            )
+            scheduler_init_result.wait_for_completion()
+            return (
+                None,
+                None,
+                port_args,
+                scheduler_init_result,
+                None,
+            )
+
         if server_args.node_rank >= 1:
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
