@@ -194,3 +194,147 @@ def get_valid_kv_indices(
         bs,
         topk,
     )
+
+
+@triton.jit
+def _sparse_mla_fwd_kernel(
+    q_ptr,
+    kv_ptr,
+    page_table_ptr,
+    out_ptr,
+    num_tokens: tl.constexpr,
+    num_heads: tl.constexpr,
+    topk: tl.constexpr,
+    head_dim: tl.constexpr,
+    v_head_dim: tl.constexpr,
+    kv_dim: tl.constexpr,
+    sm_scale: tl.constexpr,
+    logit_cap: tl.constexpr,
+    has_logit_cap: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_v = tl.program_id(1)
+    pid_h = tl.program_id(2) * BLOCK_H
+
+    v_offsets = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+    v_mask = v_offsets < v_head_dim
+    h_offsets = pid_h + tl.arange(0, BLOCK_H)
+    h_mask = h_offsets < num_heads
+
+    acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
+    m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
+    l_i = tl.full((BLOCK_H,), 0.0, dtype=tl.float32)
+
+    for k_start in range(0, topk, BLOCK_K):
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < topk
+        indices = tl.load(
+            page_table_ptr + pid_t * topk + k_offsets,
+            mask=k_mask,
+            other=-1,
+        )
+        valid = k_mask & (indices >= 0)
+        safe_indices = tl.maximum(indices, 0)
+
+        scores = tl.zeros((BLOCK_H, BLOCK_K), dtype=tl.float32)
+        for d_start in range(0, head_dim, BLOCK_D):
+            d_offsets = d_start + tl.arange(0, BLOCK_D)
+            d_mask = d_offsets < head_dim
+            q = tl.load(
+                q_ptr
+                + (pid_t * num_heads + h_offsets[:, None]) * head_dim
+                + d_offsets[None, :],
+                mask=h_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            keys = tl.load(
+                kv_ptr + d_offsets[:, None] + safe_indices[None, :] * kv_dim,
+                mask=d_mask[:, None] & valid[None, :],
+                other=0.0,
+            )
+            scores += tl.dot(q, keys)
+
+        scores *= sm_scale
+        if has_logit_cap:
+            capped = scores / logit_cap
+            scores = logit_cap * (2.0 / (1.0 + tl.exp(-2.0 * capped)) - 1.0)
+        scores = tl.where(valid[None, :] & h_mask[:, None], scores, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
+        p = tl.exp(scores - m_ij[:, None])
+        alpha = tl.exp(m_i - m_ij)
+        l_ij = l_i * alpha + tl.sum(p, axis=1)
+
+        values = tl.load(
+            kv_ptr + safe_indices[:, None] * kv_dim + v_offsets[None, :],
+            mask=valid[:, None] & v_mask[None, :],
+            other=0.0,
+        )
+        acc = acc * alpha[:, None] + tl.dot(p.to(values.dtype), values)
+        m_i = m_ij
+        l_i = l_ij
+
+    acc = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + (pid_t * num_heads + h_offsets[:, None]) * v_head_dim
+        + v_offsets[None, :],
+        acc,
+        mask=h_mask[:, None] & v_mask[None, :],
+    )
+
+
+def sparse_mla_sm80(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    page_table_1: torch.Tensor,
+    sm_scale: float,
+    v_head_dim: int,
+    logit_cap: Optional[float],
+) -> torch.Tensor:
+    """SM80-friendly sparse MLA for the NSA torch fallback path."""
+    assert q.is_cuda and kv.is_cuda and page_table_1.is_cuda
+    assert q.dim() == 3 and kv.dim() == 2 and page_table_1.dim() == 2
+    assert q.is_contiguous() and kv.is_contiguous() and page_table_1.is_contiguous()
+
+    num_tokens, num_heads, head_dim = q.shape
+    topk = page_table_1.shape[1]
+    kv_dim = kv.shape[1]
+    out = torch.empty(
+        (num_tokens, num_heads, v_head_dim),
+        dtype=q.dtype,
+        device=q.device,
+    )
+
+    block_k = 32
+    block_d = 64
+    block_h = 16
+    has_logit_cap = logit_cap is not None and logit_cap > 0
+    block_v = 128 if v_head_dim >= 128 else triton.next_power_of_2(v_head_dim)
+    _sparse_mla_fwd_kernel[
+        (num_tokens, triton.cdiv(v_head_dim, block_v), triton.cdiv(num_heads, block_h))
+    ](
+        q,
+        kv,
+        page_table_1,
+        out,
+        num_tokens,
+        num_heads,
+        topk,
+        head_dim,
+        v_head_dim,
+        kv_dim,
+        float(sm_scale),
+        float(logit_cap or 0.0),
+        has_logit_cap,
+        BLOCK_K=block_k,
+        BLOCK_D=block_d,
+        BLOCK_H=block_h,
+        BLOCK_V=block_v,
+        num_warps=4,
+    )
+    return out
