@@ -340,6 +340,7 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.dtype = getattr(model_runner, "dtype", model_runner.model_config.dtype)
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -403,6 +404,46 @@ class NativeSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _get_cuda_graph_workspace(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        metadata = getattr(self, "decode_cuda_graph_metadata", None)
+        if metadata is None:
+            return None
+        workspace = metadata.get(name)
+        if workspace is None or workspace.dtype != dtype:
+            return None
+        if len(workspace.shape) != len(shape):
+            return None
+        if any(size > max_size for size, max_size in zip(shape, workspace.shape)):
+            return None
+        slices = tuple(slice(0, size) for size in shape)
+        return workspace[slices]
+
+    def _concat_mla_absorb_q_cuda_graph(
+        self, q_nope: torch.Tensor, q_rope: torch.Tensor
+    ) -> torch.Tensor:
+        shape = (q_nope.shape[0], q_nope.shape[1], q_nope.shape[2] + q_rope.shape[2])
+        q_all = self._get_cuda_graph_workspace(
+            "q_all", shape, q_nope.dtype
+        )
+        if q_all is None:
+            return concat_mla_absorb_q_general(q_nope, q_rope)
+        torch.cat((q_nope, q_rope), dim=-1, out=q_all)
+        return q_all
+
+    def _get_page_table_topk_workspace(
+        self, topk_indices: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if topk_indices is None:
+            return None
+        return self._get_cuda_graph_workspace(
+            "page_table_topk", topk_indices.shape, torch.int32
+        )
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -815,6 +856,26 @@ class NativeSparseAttnBackend(
                 max_num_tokens,
                 self.max_context_len + (self.speculative_num_draft_tokens or 0),
                 dtype=torch.int32,
+                device=self.device,
+            ),
+            "page_table_topk": torch.empty(
+                max_num_tokens,
+                self.nsa_index_topk,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            "q_all": torch.empty(
+                max_num_tokens,
+                self.num_q_heads,
+                self.kv_cache_dim,
+                dtype=self.dtype,
+                device=self.device,
+            ),
+            "sparse_mla_out": torch.empty(
+                max_num_tokens,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                dtype=self.dtype,
                 device=self.device,
             ),
             "flashmla_metadata": (
@@ -1472,7 +1533,7 @@ class NativeSparseAttnBackend(
 
         if nsa_impl == "tilelang":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1482,7 +1543,7 @@ class NativeSparseAttnBackend(
             )
         elif nsa_impl == "flashmla_sparse":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
@@ -1506,7 +1567,7 @@ class NativeSparseAttnBackend(
             )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1534,7 +1595,7 @@ class NativeSparseAttnBackend(
             )
         elif nsa_impl == "torch":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_torch_sparse_mla(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1639,12 +1700,13 @@ class NativeSparseAttnBackend(
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
+                result=self._get_page_table_topk_workspace(topk_indices),
                 page_size=1,
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1654,7 +1716,7 @@ class NativeSparseAttnBackend(
             )
         elif self.nsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1667,7 +1729,7 @@ class NativeSparseAttnBackend(
             )
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1692,7 +1754,7 @@ class NativeSparseAttnBackend(
             )
         elif self.nsa_decode_impl == "torch":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._concat_mla_absorb_q_cuda_graph(q_nope, q_rope)
             return self._forward_torch_sparse_mla(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1768,6 +1830,11 @@ class NativeSparseAttnBackend(
         # and DeepGEMM runtime dependencies.
         kv_flat = kv_cache.reshape(-1, self.kv_cache_dim)
         num_tokens, num_heads, head_dim = q_all.shape
+        sparse_mla_out = self._get_cuda_graph_workspace(
+            "sparse_mla_out",
+            (num_tokens, num_heads, v_head_dim),
+            q_all.dtype,
+        )
         if (
             q_all.is_cuda
             and kv_flat.is_cuda
@@ -1779,19 +1846,40 @@ class NativeSparseAttnBackend(
             from sglang.srt.layers.attention.nsa.triton_kernel import sparse_mla_sm80
 
             try:
+                if sparse_mla_out is not None:
+                    if (
+                        not q_all.is_contiguous()
+                        or not kv_flat.is_contiguous()
+                        or not page_table_1.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "CUDA graph sparse MLA requires contiguous q/kv/page_table"
+                        )
+                    q_arg = q_all
+                    kv_arg = kv_flat
+                    page_table_arg = page_table_1
+                else:
+                    q_arg = q_all.contiguous()
+                    kv_arg = kv_flat.contiguous()
+                    page_table_arg = page_table_1.contiguous()
                 with _nsa_nvtx_range(
                     "sglang.nsa.sparse_mla.triton"
                     f"[tokens={num_tokens},heads={num_heads},topk={page_table_1.shape[1]}]"
                 ):
                     return sparse_mla_sm80(
-                        q_all.contiguous(),
-                        kv_flat.contiguous(),
-                        page_table_1.contiguous(),
+                        q_arg,
+                        kv_arg,
+                        page_table_arg,
                         sm_scale,
                         v_head_dim,
                         logit_cap,
+                        out=sparse_mla_out,
                     )
             except Exception as exc:
+                if sparse_mla_out is not None:
+                    raise RuntimeError(
+                        "Triton sparse MLA failed on CUDA graph workspace path"
+                    ) from exc
                 self._disable_sparse_mla_triton = True
                 if not hasattr(self, "_sparse_mla_triton_fallback_warned"):
                     print(
@@ -2236,6 +2324,7 @@ class NativeSparseAttnBackend(
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
+                result=self._get_page_table_topk_workspace(topk_indices),
                 page_size=1,
             )
 

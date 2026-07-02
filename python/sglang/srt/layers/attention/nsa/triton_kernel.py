@@ -295,6 +295,7 @@ def sparse_mla_sm80(
     sm_scale: float,
     v_head_dim: int,
     logit_cap: Optional[float],
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SM80-friendly sparse MLA for the NSA torch fallback path."""
     assert q.is_cuda and kv.is_cuda and page_table_1.is_cuda
@@ -304,11 +305,16 @@ def sparse_mla_sm80(
     num_tokens, num_heads, head_dim = q.shape
     topk = page_table_1.shape[1]
     kv_dim = kv.shape[1]
-    out = torch.empty(
-        (num_tokens, num_heads, v_head_dim),
-        dtype=q.dtype,
-        device=q.device,
-    )
+    if out is None:
+        out = torch.empty(
+            (num_tokens, num_heads, v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+    else:
+        assert out.shape == (num_tokens, num_heads, v_head_dim)
+        assert out.dtype == q.dtype and out.device == q.device
+        assert out.is_contiguous()
 
     block_k = 32
     block_d = 64

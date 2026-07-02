@@ -13,11 +13,16 @@ from sglang.srt.ae_disaggregation.nvshmem_utils import (
 )
 from sglang.srt.ae_disaggregation.utils import get_ep_group_info
 from sglang.srt.distributed import (
+    get_pp_group,
+    get_tp_group,
     init_distributed_environment,
     initialize_ae_model_parallel,
     set_custom_all_reduce,
 )
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    initialize_dp_attention,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.utils import get_available_gpu_memory
@@ -47,6 +52,9 @@ class AttentionRunner(ModelRunner):
         initialize_dp_attention(
             server_args=self.server_args, model_config=self.model_config
         )
+        self.tp_group = get_tp_group()
+        self.pp_group = get_pp_group()
+        self.attention_tp_group = get_attention_tp_group()
         self.init_nvshmem_distributed()
         self._ae_nvshmem_initialized = True
         return get_available_gpu_memory(

@@ -7123,9 +7123,10 @@ class ServerArgs:
                 "AE disaggregation owns routed-MoE transport. Set "
                 "--moe-a2a-backend none."
             )
-        if not self.disable_cuda_graph:
+        if not self.disable_cuda_graph and not self.cuda_graph_bs:
             raise ValueError(
-                "The first AE prototype requires --disable-cuda-graph."
+                "AE disaggregation with CUDA graph requires explicit "
+                "--cuda-graph-bs to keep capture shapes bounded."
             )
         if self.disaggregation_mode != "null":
             raise ValueError(
