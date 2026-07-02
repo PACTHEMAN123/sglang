@@ -13,9 +13,13 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.glm4_moe import Glm4MoeGate, Glm4MoeSparseMoeBlock
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE, MoEGate
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    maybe_fuse_routed_scale_and_shared_add,
+)
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 
 
@@ -46,15 +50,21 @@ class GlmMoeLocalExperts(nn.Module):
         object.__setattr__(padded_config, "n_shared_experts", None)
 
         for layer_id in layer_ids:
-            block = Glm4MoeSparseMoeBlock(
+            block = DeepseekV2MoE(
                 config=padded_config,
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=f"model.layers.{layer_id}.mlp",
             )
-            # The block above needs padded experts, but routing must remain
-            # strictly in the real 256-expert ID domain.
-            block.gate = Glm4MoeGate(config=config)
+            # The block above allocates padded experts for EP=6.  Routing must
+            # remain in the real 256-expert ID domain and must match the
+            # GLM5.1 DSA baseline, which uses DeepseekV2MoE/MoEGate rather than
+            # the older Glm4Moe gate path.
+            block.gate = MoEGate(
+                config=config,
+                quant_config=quant_config,
+                prefix=f"model.layers.{layer_id}.mlp.gate",
+            )
             block.topk = TopK(
                 top_k=config.num_experts_per_tok,
                 layer_id=layer_id,
@@ -63,10 +73,18 @@ class GlmMoeLocalExperts(nn.Module):
                 num_expert_group=config.n_group,
                 topk_group=config.topk_group,
                 correction_bias=block.gate.e_score_correction_bias,
+                quant_config=quant_config,
                 routed_scaling_factor=config.routed_scaling_factor,
                 num_fused_shared_experts=0,
                 apply_routed_scaling_factor_on_output=getattr(
                     block.experts, "should_fuse_routed_scaling_factor_in_topk", False
+                ),
+                fused_shared_experts_scaling_factor=None,
+                output_format=(
+                    TopKOutputFormat.STANDARD
+                    if (quant_config is None)
+                    and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                    else None
                 ),
             )
             self.layers[str(layer_id)] = block
@@ -76,8 +94,15 @@ class GlmMoeLocalExperts(nn.Module):
         router_logits = block.gate(hidden_states)
         topk_output = block.topk(hidden_states, router_logits)
         output = block.experts(hidden_states, topk_output)
-        if not block.experts.should_fuse_routed_scaling_factor_in_topk:
-            output *= block.routed_scaling_factor
+        # Match DeepseekV2MoE.forward_normal scaling semantics.  The A worker
+        # owns shared experts, so E applies only the routed-only branch of the
+        # same helper used by the baseline path.
+        output = maybe_fuse_routed_scale_and_shared_add(
+            block.experts,
+            output,
+            None,
+            block.routed_scaling_factor,
+        )
         return output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

@@ -25,6 +25,8 @@ from sglang.srt.ae_disaggregation.nvshmem_utils import (
 )
 
 DEBUG_NVSHMEM_VERIFY = os.environ.get("DEBUG_NVSHMEM_VERIFY", "0") == "1"
+_ATTN_A2E_ITERATIONS = {}
+_ATTN_E2A_ITERATIONS = {}
 
 ITER_SHIFT = 40
 LAYER_SHIFT = 20
@@ -109,7 +111,14 @@ class AttnNvshmemCommunicationHandler:
         self.a2e_sigs = global_server_args_dict["nvshmem_a2e_sigs"]
         self.e2a_dst_slots = global_server_args_dict["nvshmem_e2a_dst_slots"]
         self.e2a_sigs = global_server_args_dict["nvshmem_e2a_sigs"]
-        self._iteration = {i: 0 for i in range(self.micro_batch_num)}
+        # DeepseekAeSparseMoeBlock owns one handler per MoE layer.  The
+        # communication sequence is per A-rank process, not per layer, so keep
+        # it in module-level dictionaries shared by all handler instances.
+        for i in range(self.micro_batch_num):
+            _ATTN_A2E_ITERATIONS.setdefault(i, 0)
+            _ATTN_E2A_ITERATIONS.setdefault(i, 0)
+        self._a2e_iteration = _ATTN_A2E_ITERATIONS
+        self._e2a_iteration = _ATTN_E2A_ITERATIONS
         self.shape = {}
 
     async def send_attention_result(
@@ -120,8 +129,8 @@ class AttnNvshmemCommunicationHandler:
         if DEBUG_NVSHMEM_VERIFY:
             gpu_hidden_state = torch.full_like(gpu_hidden_state, layer_index)
 
-        self._iteration[batch_id] += 1
-        flag_val = _pack_signal(self._iteration[batch_id], layer_index, tokens)
+        self._a2e_iteration[batch_id] += 1
+        flag_val = _pack_signal(self._a2e_iteration[batch_id], layer_index, tokens)
         flat = gpu_hidden_state.reshape(-1)
         data_bytes = flat.numel() * flat.element_size()
 
@@ -143,8 +152,8 @@ class AttnNvshmemCommunicationHandler:
             )
 
     async def send_skip_signal(self, batch_id: int):
-        self._iteration[batch_id] += 1
-        flag_val = _pack_signal(self._iteration[batch_id], 0, 0)
+        self._a2e_iteration[batch_id] += 1
+        flag_val = _pack_signal(self._a2e_iteration[batch_id], 0, 0)
         dst_buf = self.a2e_bufs[batch_id]["dst"]
         sig = self.a2e_sigs[batch_id]["sig"]
         stream = _current_stream_handle()
@@ -166,8 +175,9 @@ class AttnNvshmemCommunicationHandler:
         for size in shape:
             numel *= size
 
-        self._iteration[batch_id] += 1
-        flag_val = self._iteration[batch_id]
+        self._e2a_iteration[batch_id] += 1
+        tokens = shape[0] if len(shape) > 0 else 0
+        flag_val = _pack_signal(self._e2a_iteration[batch_id], layer_index, tokens)
         sw = _current_sw()
         n_peers = len(self.expected_ep_ranks)
         if n_peers == 1:
@@ -221,7 +231,8 @@ class MoENvshmemCommunicationHandler:
         self.e2a_dst_slots = global_server_args_dict["nvshmem_e2a_dst_slots"]
         self.e2a_src = global_server_args_dict["nvshmem_e2a_src"]
         self.e2a_sigs = global_server_args_dict["nvshmem_e2a_sigs"]
-        self._iteration = {i: 0 for i in range(self.micro_batch_num)}
+        self._a2e_iteration = {i: 0 for i in range(self.micro_batch_num)}
+        self._e2a_iteration = {i: 0 for i in range(self.micro_batch_num)}
         self._cached_tokens = {}
         self._next_layer_idx = {}
 
@@ -236,8 +247,8 @@ class MoENvshmemCommunicationHandler:
             print(f"[MoENvshmem] rank={self.rank} shutdown requested: {reason}")
 
     def recv_attention_result(self, batch_id):
-        self._iteration[batch_id] += 1
-        threshold = _signal_threshold(self._iteration[batch_id])
+        self._a2e_iteration[batch_id] += 1
+        threshold = _signal_threshold(self._a2e_iteration[batch_id])
         try:
             nvshmem.core.signal_wait(
                 self.a2e_sigs[batch_id]["sig"],
@@ -274,8 +285,9 @@ class MoENvshmemCommunicationHandler:
 
     def send_moe_result(self, layer_index, batch_id, result_state):
         try:
-            self._iteration[batch_id] += 1
-            flag_val = self._iteration[batch_id]
+            self._e2a_iteration[batch_id] += 1
+            tokens = result_state.shape[0] if result_state.dim() > 0 else 0
+            flag_val = _pack_signal(self._e2a_iteration[batch_id], layer_index, tokens)
             if DEBUG_NVSHMEM_VERIFY:
                 result_state = torch.full_like(result_state, layer_index)
 
