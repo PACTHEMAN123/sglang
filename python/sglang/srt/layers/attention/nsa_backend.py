@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -76,6 +77,17 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
+
+
+@contextlib.contextmanager
+def _nsa_nvtx_range(name: str):
+    with contextlib.ExitStack() as stack:
+        if torch.autograd._profiler_enabled():
+            stack.enter_context(torch.profiler.record_function(name))
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push(name)
+            stack.callback(torch.cuda.nvtx.range_pop)
+        yield
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -1756,25 +1768,63 @@ class NativeSparseAttnBackend(
         # and DeepGEMM runtime dependencies.
         kv_flat = kv_cache.reshape(-1, self.kv_cache_dim)
         num_tokens, num_heads, head_dim = q_all.shape
+        if (
+            q_all.is_cuda
+            and kv_flat.is_cuda
+            and page_table_1.is_cuda
+            and page_table_1.dim() == 2
+            and v_head_dim <= self.kv_cache_dim
+            and not getattr(self, "_disable_sparse_mla_triton", False)
+        ):
+            from sglang.srt.layers.attention.nsa.triton_kernel import sparse_mla_sm80
+
+            try:
+                with _nsa_nvtx_range(
+                    "sglang.nsa.sparse_mla.triton"
+                    f"[tokens={num_tokens},heads={num_heads},topk={page_table_1.shape[1]}]"
+                ):
+                    return sparse_mla_sm80(
+                        q_all.contiguous(),
+                        kv_flat.contiguous(),
+                        page_table_1.contiguous(),
+                        sm_scale,
+                        v_head_dim,
+                        logit_cap,
+                    )
+            except Exception as exc:
+                self._disable_sparse_mla_triton = True
+                if not hasattr(self, "_sparse_mla_triton_fallback_warned"):
+                    print(
+                        "Warning: Triton sparse MLA fallback failed; "
+                        f"using PyTorch NSA fallback instead: {exc}"
+                    )
+                    self._sparse_mla_triton_fallback_warned = True
+
         out = q_all.new_empty((num_tokens, num_heads, v_head_dim))
         chunk_size = 32
 
-        for start in range(0, num_tokens, chunk_size):
-            end = min(start + chunk_size, num_tokens)
-            indices = page_table_1[start:end].to(torch.long)
-            valid = indices >= 0
-            safe_indices = indices.clamp(min=0)
-            selected = kv_flat.index_select(0, safe_indices.reshape(-1)).view(
-                end - start, indices.shape[1], self.kv_cache_dim
-            )
-            keys = selected[..., :head_dim]
-            values = selected[..., :v_head_dim]
-            scores = torch.einsum("bhd,btd->bht", q_all[start:end], keys) * sm_scale
-            if logit_cap is not None and logit_cap > 0:
-                scores = logit_cap * torch.tanh(scores / logit_cap)
-            scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
-            probs = torch.softmax(scores.float(), dim=-1).to(q_all.dtype)
-            out[start:end] = torch.einsum("bht,btd->bhd", probs, values)
+        with _nsa_nvtx_range(
+            "sglang.nsa.sparse_mla.pytorch_fallback"
+            f"[tokens={num_tokens},heads={num_heads},topk={page_table_1.shape[1]}]"
+        ):
+            for start in range(0, num_tokens, chunk_size):
+                end = min(start + chunk_size, num_tokens)
+                indices = page_table_1[start:end].to(torch.long)
+                valid = indices >= 0
+                safe_indices = indices.clamp(min=0)
+                selected = kv_flat.index_select(0, safe_indices.reshape(-1)).view(
+                    end - start, indices.shape[1], self.kv_cache_dim
+                )
+                keys = selected[..., :head_dim]
+                values = selected[..., :v_head_dim]
+                scores = (
+                    torch.einsum("bhd,btd->bht", q_all[start:end], keys) * sm_scale
+                )
+                if logit_cap is not None and logit_cap > 0:
+                    scores = logit_cap * torch.tanh(scores / logit_cap)
+                scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+                probs = torch.softmax(scores.float(), dim=-1).to(q_all.dtype)
+                out[start:end] = torch.einsum("bht,btd->bhd", probs, values)
 
         return out
 

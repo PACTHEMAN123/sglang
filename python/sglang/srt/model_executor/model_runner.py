@@ -3247,8 +3247,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
+        nvtx_span_ctx = _maybe_nvtx_range(
+            f"sglang.attn.forward_batch:{_build_step_span_name(forward_batch)}"
+        )
         with (
             step_span_ctx,
+            nvtx_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
@@ -3589,6 +3593,17 @@ def _build_step_span_name(forward_batch: ForwardBatch) -> str:
         ext_toks = forward_batch.extend_num_tokens or 0
         return f"step[EXTEND bs={bs} toks={ext_toks}]"
     return f"step[{mode.name} bs={bs}]"
+
+
+@contextlib.contextmanager
+def _maybe_nvtx_range(name: str):
+    with contextlib.ExitStack() as stack:
+        if torch.autograd._profiler_enabled():
+            stack.enter_context(torch.profiler.record_function(name))
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push(name)
+            stack.callback(torch.cuda.nvtx.range_pop)
+        yield
 
 
 @dataclass
